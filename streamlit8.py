@@ -325,13 +325,13 @@ def refine_query_with_history(new_query, chat_history):
 
     Your task:
     - If the input is a valid legal-related query, refine it into a standalone, clear, **affirmative sentence** (not a question), in English, suitable for document search.
-    - If the input is too vague, conversational (e.g., "ok", "thanks"), or not legal-related, respond with: "Query too vague or not legal-related".
+    - If the input is too vague or conversational (e.g., "ok", "thanks"), respond with a blank.
 
     Chat History (most recent first): {context_str}
 
     New Query: {new_query}
 
-    Refined Search Query (respond only with the refined query in ENGLISH, or respond with 'Query too vague or not legal-related'):
+    Refined Search Query (respond ONLY with the refined query in ENGLISH, or leave it blank):
     """
 
     try:
@@ -388,7 +388,7 @@ def main():
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message["role"] == "assistant" and message.get("sources"):
-                formatted_sources = [f"{src} (Category: {cat}, Chunk: {chunk})"for src, cat, chunk in message['sources']]
+                formatted_sources = [f"{src}"for src in message['sources']]
                 st.markdown(f"**Sources:** {', '.join(formatted_sources)}")
 
     # Handle new input
@@ -407,8 +407,8 @@ def main():
         # Get current chat history for context
         chat_history = current_chat["messages"]
         refined_query = refine_query_with_history(user_input, chat_history)
-        if "Query too vague or not legal-related" in refined_query:
-            final_response = "The query is too vague or not legal-related. Please provide a more specific question."
+        if not refined_query.strip():  # Checks if the refined query is empty or just spaces
+            final_response = "Please provide your question." 
         else:
             while agent.current_attempt < agent.max_attempts:
                 if agent.current_attempt > 0:
@@ -423,7 +423,6 @@ def main():
                 if agent.validate_answer(response, relevant_contexts, user_input):
                     final_response = response
                     all_sources.update(relevant_sources)
-                    formatted_sources = list({f"{src}" for src, cat, chunk in all_sources})
                     break
                     
                 agent.current_attempt += 1
@@ -431,7 +430,6 @@ def main():
             # Fallback response
             if not final_response:
                 final_response = "No relevant documents were found in the database to answer your question. Please try rephrasing or clarifying your query."
-                formatted_sources = []
 
             # Add assistant response to current chat
             current_chat["messages"].append({
@@ -444,8 +442,8 @@ def main():
         # Display assistant response
         with st.chat_message("assistant"):
             st.write(final_response)
-            if formatted_sources:
-                st.markdown(f"\n**Verified Sources:** {', '.join(formatted_sources)}")
+            if all_sources:
+                st.markdown(f"\n**Verified Sources:** {', '.join({src for src, cat, chunk in all_sources})}")
 
 if __name__ == "__main__":
     main()
