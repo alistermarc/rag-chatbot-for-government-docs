@@ -1,0 +1,7 @@
+boto3==1.38.5
+Django==5.2.1
+openai==1.78.1
+pandas==2.2.3
+Requests==2.32.3
+transformers==4.48.1
+weaviate_client==4.11.3

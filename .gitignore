@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv/
+
+# Django
+*.sqlite3
+*.db
+
+# VSCode and PyCharm config (optional)
+.vscode/
+.idea/
+
+# Environment variables and secrets
+.env
+
+# macOS and Linux
+.DS_Store
+Thumbs.db
+

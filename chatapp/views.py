@@ -22,7 +22,7 @@ class ModelManager:
         with torch.no_grad():
             embeddings = self.model(**inputs)[0][:, 0]
         return torch.nn.functional.normalize(embeddings, p=2, dim=1).squeeze(0).tolist()
-model_manager = ModelManager(r"/home/ubuntu/Models3/Embeddings/BAAI/bge-base-en-v1.5")   
+model_manager = ModelManager(r"/home/ubuntu/Capstone-Project/embedding/")   
 
 
 class ChatAPIView(APIView):
