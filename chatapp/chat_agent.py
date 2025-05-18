@@ -1,46 +1,376 @@
-from transformers import AutoTokenizer, AutoModel
-import torch
-import weaviate
-from weaviate.classes.query import HybridFusion, MetadataQuery, Filter
-import time
-from openai import OpenAI
-from typing import List, Dict
 import os
-from itertools import groupby
 import re
+from contextlib import AbstractContextManager
+from itertools import groupby
+from typing import Dict, List
+
+import weaviate
 from openai import OpenAI
-from .services import client_generation, client_refine
-from .textract import TextractProcessor, DocumentPreprocessor, DocumentIndexer
+from weaviate.classes.query import Filter, HybridFusion, MetadataQuery
 
-client_classify = OpenAI()
-client_answer = OpenAI()
-client_generation = OpenAI()
-client_refine = OpenAI()
-client_hyde = OpenAI()
-client_validate = OpenAI()
+from .models import ModelManager
+
+# Initialize models 
+base_dir = os.path.dirname(os.path.abspath(__file__))
+embedding_path = os.path.join(base_dir, "..", "embeddings")
+# For embedding model
+model_manager = ModelManager(embedding_path)  
+# For classification, query transformation, generation, and validation
+client = OpenAI()
+  
+
+class RetrievalDecisionModule:
+    def __init__(self, client=client, model="gpt-4o-mini", temperature=0.0, max_tokens=5):
+        self.client = client
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+
+    def classify_if_retrieval_needed(self, user_input, context_str):
+        prompt = f"""
+        You are an assistant helping decide whether a user message needs document retrieval or not.
+
+        Instructions:
+        - If the user's message is purely conversational (e.g. "hi", "thanks", "that's helpful") or can be answered from previous chat messages or common knowledge (e.g. general facts), respond: **"no"**.
+        - If the message requires external knowledge, document retrieval, or detailed information not provided in the chat history, respond: **"yes"**.
+        - If the user's message is a simple factual question (e.g., "What is the capital of France?" or "How many days are in a week?"), respond: **"no"**.
+        
+        Chat History:
+        {context_str}
+
+        User Input:
+        {user_input}
+
+        Does this query need document retrieval? (Answer only "yes" or "no")
+        """
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt.strip()}],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens
+            )
+            return response.choices[0].message.content.strip().lower() == "yes"
+        except Exception:
+            return True
 
 
-class ModelManager:
-    def __init__(self, model_path):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModel.from_pretrained(model_path, add_pooling_layer=True)
+class QueryTransformationModule:
+    def __init__(
+        self,
+        client=client,
+        refine_model="gpt-4o-mini",
+        hyde_model="gpt-4o-mini",
+        refine_temperature=0.3,
+        hyde_temperature=0.7,
+        refine_max_tokens=300,
+        hyde_max_tokens=512
+    ):
+        self.client = client
+        self.refine_model = refine_model
+        self.hyde_model = hyde_model
+        self.refine_temperature = refine_temperature
+        self.hyde_temperature = hyde_temperature
+        self.refine_max_tokens = refine_max_tokens
+        self.hyde_max_tokens = hyde_max_tokens
 
-    def get_embedding(self, text):
-        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-        with torch.no_grad():
-            embeddings = self.model(**inputs)[0][:, 0]
-        return torch.nn.functional.normalize(embeddings, p=2, dim=1).squeeze(0).tolist()
-model_manager = ModelManager(r"/home/ubuntu/Capstone-Project/embedding/")    
+    def refine_query_with_history(self, new_query, context_str):
+        prompt = f"""
+        You're legal query refiner helping create effective search queries for Quezon City documents. Consider both:
+        1. The new user query
+        2. Relevant context from chat history (if applicable)
+
+        Your task:
+        - Refine the query into a standalone, clear, **affirmative sentence** (not a question), in English, suitable for document search.
+
+        Chat History (most recent first): {context_str}
+
+        New Query: {new_query}
+
+        Refined Search Query (respond ONLY with the refined query in ENGLISH):
+        """
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.refine_model,
+                messages=[{"role": "user", "content": prompt.strip()}],
+                temperature=self.refine_temperature,
+                max_tokens=self.refine_max_tokens
+            )
+            return response.choices[0].message.content.strip()
+        except Exception:
+            return new_query
+
+    def generate_hypothetical_document(self, query: str) -> str:
+        prompt = f"""
+        You are a legal research assistant. Based on the query below, generate a short, hypothetical excerpt from a legal document (e.g., ordinance or resolution) that could plausibly address it.
+
+        - The content should be realistic and relevant.
+        - Structure it formally, like a legal provision.
+        - Translate to English if needed.
+
+        Query: "{query}"
+
+        Hypothetical legal document (1 paragraph):
+        """
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.hyde_model,
+                messages=[
+                    {"role": "user", "content": prompt.strip()}
+                ],
+                temperature=self.hyde_temperature,
+                max_tokens=self.hyde_max_tokens
+            )
+            return response.choices[0].message.content.strip()
+        except Exception:
+            return "Error generating hypothetical document"
+
+
+class DocumentRetrievalModule(AbstractContextManager):
+    def __init__(self, host="localhost", collection_name="BAAI", alpha=0.5, context_window=1):
+        self.host = host
+        self.collection_name = collection_name
+        self.alpha = alpha
+        self.context_window = context_window
+        self.client = None
+
+    def __enter__(self):
+        self.client = weaviate.connect_to_local(host=self.host)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.client:
+            self.client.close()
+
+    def search_documents(self, query_text: str, max_results: int) -> List[Dict]:
+        try:
+            self.collection = self.client.collections.get(self.collection_name)
+            response = self.collection.query.hybrid(
+                query=query_text,
+                vector=model_manager.get_embedding(query_text),
+                alpha=self.alpha,
+                fusion_type=HybridFusion.RELATIVE_SCORE,
+                limit=max_results,
+                return_properties=["text", "source", "category", "chunk_index"],
+                return_metadata=MetadataQuery(score=True)
+            )
+
+            results = []
+            seen = set()
+
+            for obj in response.objects:
+                key = (obj.properties["source"], obj.properties["category"], obj.properties["chunk_index"])
+                if key not in seen:
+                    seen.add(key)
+                    results.append({
+                        "text": obj.properties["text"],
+                        "source": obj.properties["source"],
+                        "category": obj.properties["category"],
+                        "chunk_index": obj.properties["chunk_index"],
+                        "score": obj.metadata.score
+                    })
+
+            merged_results = self.expand_documents(results)
+            return merged_results
+
+        except Exception as e:
+            return {"error": "Error searching for documents", "details": str(e)}
+
+    def expand_documents(self, results: List[Dict]) -> List[Dict]:
+        merged_results = []
+        if results:
+            expanded_chunks = self.expand_document_search(results)
+            seen = {(chunk['source'], chunk['category'], chunk['chunk_index']) for chunk in results}
+
+            for chunk in expanded_chunks:
+                if (chunk['source'], chunk['category'], chunk['chunk_index']) not in seen:
+                    results.append({
+                        "text": chunk["text"],
+                        "source": chunk["source"],
+                        "category": chunk["category"],
+                        "chunk_index": chunk["chunk_index"],
+                        "score": 0})
+
+            category_order = {
+                'Introduction': 0,
+                'Preamble': 1,
+                'Operative': 2,
+                'Signature': 3,
+                'Uncategorized': 4
+            }
+
+            sorted_items = sorted(
+                results,
+                key=lambda x: (
+                    x['source'].lower(),
+                    int(category_order.get(x['category'], 4)),
+                    int(x['chunk_index'])
+                )
+            )
+
+            for (source, category), group in groupby(sorted_items, key=lambda x: (x['source'], x['category'])):
+                group = list(group)
+                group.sort(key=lambda x: x['chunk_index'])
+
+                merged = [group[0]]
+                for item in group[1:]:
+                    last = merged[-1]
+
+                    if item['chunk_index'] == last['chunk_index'] + 1:
+                        last['text'] += item['text']
+                        last['score'] = max(last['score'], item['score'])
+                        last['chunk_index'] = item['chunk_index']
+                    else:
+                        merged.append(item)
+                merged_results.extend(merged)
+        return sorted(merged_results, key=lambda x: x['score'], reverse=True)
+
+    def expand_document_search(self, initial_results: List[Dict]) -> List[Dict]:
+        expanded_chunks = []
+        doc_sources = set()
+
+        for chunk in reversed(initial_results):
+            doc_sources.add((chunk['source'], chunk['category'], chunk['chunk_index']))
+
+        try:
+            for source, category, index in doc_sources:
+                filters = (
+                    Filter.by_property("source").equal(source)
+                    & Filter.by_property("category").equal(category)
+                    & Filter.by_property("chunk_index").greater_than(index - self.context_window - 1)
+                    & Filter.by_property("chunk_index").less_than(index + self.context_window + 1)
+                )
+
+                response = self.collection.query.fetch_objects(
+                    filters=filters,
+                    return_properties=["text", "source", "category", "chunk_index"]
+                )
+
+                for obj in response.objects:
+                    expanded_chunks.append({
+                        "text": obj.properties["text"],
+                        "source": obj.properties["source"],
+                        "category": obj.properties["category"],
+                        "chunk_index": obj.properties["chunk_index"],
+                        "score": 0
+                    })
+            return expanded_chunks
+
+        except Exception as e:
+            return {"error": "Error expanding document search", "details": str(e)}
+
+
+class ResponseGeneratorModule:
+    def __init__(
+        self,
+        client=client,
+        generation_model_with_retrieval="gpt-4o",
+        generation_model_without_retrieval="gpt-4o-mini",
+        generation_temperature=0.1,
+        max_tokens=512
+    ):
+        self.client = client
+        self.generation_model_with_retrieval = generation_model_with_retrieval
+        self.generation_model_without_retrieval = generation_model_without_retrieval
+        self.generation_temperature = generation_temperature
+        self.max_tokens = max_tokens
+
+    def conversation_without_retrieval(self, user_input, context_str=None):
+        prompt = f"""
+        You are a Quezon City Legal Provider. Answer the query using your internal knowledge or the provided conversation history if applicable.
+
+        Conversation history:
+        {context_str if context_str else 'No previous conversation history.'}
+
+        User query:
+        {user_input}
+
+        Please answer clearly and accurately.  
+        Note: If the user query is in English, provide the answer in English. If the query is in Filipino, provide the answer in Filipino.
+        """
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.generation_model_without_retrieval,
+                messages=[{"role": "user", "content": prompt.strip()}],
+                temperature=self.generation_temperature,
+                max_tokens=self.max_tokens
+            )
+            return response.choices[0].message.content.strip()
+        except Exception:
+            return "Error generating response"
+
+
+    def generate_response(self, query, context_docs, context_sources):
+        context_str = "\n\n".join(
+            [f"Document {index + 1}:\n{doc['text']}" for index, doc in enumerate(context_docs)]
+        )
+        
+        prompt = f"""
+        You are a legal AI assistant helping users find information from ordinances and resolutions. 
+        Answer the query **strictly using the provided context below**. 
+        Do NOT make up information or guess. If the answer is not explicitly stated in the context, respond with: 
+        "Based on the available documents, there is no clear answer to the query."
+
+        If you use any context in your answer, you must clearly indicate which document(s) you used **using the format: "Document X"** (e.g. Document 1, Document 2).
+
+        Query: {query}
+
+        Context: {context_str if context_docs else 'No relevant documents found.'}
+
+        Note: If the user query is in English, provide the answer in English. If the query is in Filipino, provide the answer in Filipino.
+        """
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.generation_model_with_retrieval,
+                messages=[{"role": "user", "content": prompt.strip()}],
+                temperature=self.generation_temperature,
+                max_tokens=self.max_tokens
+            )
+
+            generated_answer = response.choices[0].message.content.strip()
+
+            doc_numbers = list(set(re.findall(r"document\s+(\d+)", generated_answer, re.IGNORECASE)))
+            relevant_sources = [context_sources[int(num) - 1] for num in doc_numbers if num.isdigit()]
+            relevant_contexts = [context_docs[int(num) - 1] for num in doc_numbers if num.isdigit()]
+            print(doc_numbers)
+            generated_answer = re.sub(
+                r"(\(?\s*(See\s+)?(Sources?:\s*)?(Document\s+\d+[,\s]*)+(and\s+)?(Document\s+\d+)?\s*\)?)", 
+                "", 
+                generated_answer, 
+                flags=re.IGNORECASE
+            ).strip()
+
+            return generated_answer, relevant_sources, relevant_contexts
+        except Exception:
+            return "Error generating response", [], []
+
 
 class AnswerValidationAgent:
-    def __init__(self, max_attempts=3):
+    def __init__(
+        self,
+        client=client,
+        model="gpt-4o-mini",
+        temperature=0.0,
+        max_tokens=512,
+        max_attempts=3
+    ):
+        self.client = client
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
         self.max_attempts = max_attempts
         self.current_attempt = 0
-        self.search_params = {'max_results': 7,  'alpha': 0.5}
+        self.search_params = {'max_results': 7, 'alpha': 0.5}
 
     def validate_answer(self, answer, context_docs, query):
         if not context_docs:
             return False
+
         context_str = "\n\n".join(doc['text'] for doc in context_docs)
         prompt = f"""
         Legal Answer Validation - Strict Check:
@@ -62,322 +392,13 @@ class AnswerValidationAgent:
         """
 
         try:
-            response = client_validate.chat.completions.create(
-                model="gpt-4o-mini",
+            response = self.client.chat.completions.create(
+                model=self.model,
                 messages=[{"role": "user", "content": prompt.strip()}],
-                temperature=0.0
+                temperature=self.temperature,
+                max_tokens=self.max_tokens
             )
             content = response.choices[0].message.content.strip().lower()
             return 'valid' in content and 'invalid' not in content
-        except Exception as e:
+        except Exception:
             return False
-        
-
-class DocumentSearcher:
-    def __init__(self, host="localhost", collection_name="BAAI", alpha=0.5, context_window=1):
-        self.host = host
-        self.collection_name = collection_name
-        self.alpha = alpha
-        self.context_window = context_window
-
-    def _connect(self):
-        """Helper to connect to the Weaviate client."""
-        return weaviate.connect_to_local(host=self.host)
-
-    def search_documents(self, query_text: str, max_results: int) -> List[Dict]:
-        try:
-            weaviate_client = self._connect()
-            collection = weaviate_client.collections.get(self.collection_name)
-            response = collection.query.hybrid(
-                query=query_text,
-                vector=model_manager.get_embedding(query_text),
-                alpha=self.alpha,
-                fusion_type=HybridFusion.RELATIVE_SCORE,
-                limit=max_results,
-                return_properties=["text", "source", "category", "chunk_index"],
-                return_metadata=MetadataQuery(score=True)
-            )
-
-            results = []
-            for obj in response.objects:
-                results.append({
-                    "text": obj.properties["text"],
-                    "source": obj.properties["source"],
-                    "category": obj.properties["category"],
-                    "chunk_index": obj.properties["chunk_index"],
-                    "score": obj.metadata.score
-                })
-
-            # Document expansion logic
-            merged_results = self._expand_documents(results)
-
-            return merged_results
-        except Exception as e:
-            return {"error": "Error searching for documents", "details": str(e)}
-        finally:
-            weaviate_client.close()
-
-    def _expand_documents(self, results: List[Dict]) -> List[Dict]:
-        """Expand document search results by looking for adjacent chunks."""
-        merged_results = []
-        if results:
-            expanded_chunks = self.expand_document_search(results)
-            seen = {(chunk['source'], chunk['category'], chunk['chunk_index']) for chunk in results}
-
-            for chunk in expanded_chunks:
-                if (chunk['source'], chunk['category'], chunk['chunk_index']) not in seen:
-                    results.append({
-                        "text": chunk["text"],
-                        "source": chunk["source"],
-                        "category": chunk["category"],
-                        "chunk_index": chunk["chunk_index"],
-                        "score": 0.4})
-
-            # Custom order for category
-            category_order = {
-                'Introduction': 0,
-                'Preamble': 1,
-                'Operative': 2,
-                'Signature': 3,
-                'Uncategorized': 4
-            }
-
-            # Keep highest-scoring unique (source, category, chunk_index)
-            best_results = {}
-            for item in results:
-                key = (item['source'], item['category'], item['chunk_index'])
-                if key not in best_results or item['score'] > best_results[key]['score']:
-                    best_results[key] = item
-
-            # Sort
-            sorted_items = sorted(
-                best_results.values(),
-                key=lambda x: (
-                    x['source'],
-                    category_order.get(x['category'], float('inf')),
-                    x['chunk_index']
-                )
-            )
-
-            # Group and merge consecutive chunks
-            for (source, category), group in groupby(sorted_items, key=lambda x: (x['source'], x['category'])):
-                group = list(group)
-                group.sort(key=lambda x: x['chunk_index'])
-
-                merged = [group[0]]
-                for item in group[1:]:
-                    last = merged[-1]
-                    if item['chunk_index'] == last['chunk_index'] + 1:
-                        last['text'] += item['text']
-                        last['score'] = max(last['score'], item['score'])
-                    else:
-                        merged.append(item)
-                merged_results.extend(merged)
-
-        return sorted(merged_results, key=lambda x: x['score'], reverse=True)
-
-    def expand_document_search(self, initial_results: List[Dict]) -> List[Dict]:
-        """Expand search results by fetching adjacent chunks."""
-        expanded_chunks = []
-        doc_sources = set()
-
-        # Get adjacent chunks from the same documents
-        for chunk in reversed(initial_results):
-            doc_sources.add((chunk['source'], chunk['category'], chunk['chunk_index']))
-
-        try:
-            weaviate_client = self._connect()
-            collection = weaviate_client.collections.get(self.collection_name)
-            for source, category, index in doc_sources:
-                filters = (
-                    Filter.by_property("source").equal(source)
-                    & Filter.by_property("category").equal(category)
-                    & Filter.by_property("chunk_index").greater_than(index - self.context_window - 1)
-                    & Filter.by_property("chunk_index").less_than(index + self.context_window + 1)
-                )
-
-                response = collection.query.fetch_objects(
-                    filters=filters,
-                    return_properties=["text", "source", "category", "chunk_index"]
-                )
-
-                for obj in response.objects:
-                    expanded_chunks.append({
-                        "text": obj.properties["text"],
-                        "source": obj.properties["source"],
-                        "category": obj.properties["category"],
-                        "chunk_index": obj.properties["chunk_index"],
-                        "score": 0.4
-                    })
-            return expanded_chunks
-        except Exception as e:
-            return {"error": "Error expanding document search", "details": str(e)}
-        finally:
-            weaviate_client.close()
-
-
-def classify_if_retrieval_needed(user_input, chat_history):
-    context_messages = []
-    for msg in reversed(chat_history[-6:]):
-        if msg["role"] == "user":
-            context_messages.insert(0, f"User: {msg['content']}")
-        elif msg["role"] == "assistant":
-            context_messages.insert(0, f"Assistant: {msg['content']}")
-
-    context_str = "\n".join(context_messages) if context_messages else "No previous context"
-
-    prompt = f"""
-    You are an assistant helping decide whether a user message needs document retrieval or not.
-
-    Instructions:
-    - If the user's message is purely conversational (e.g. "hi", "thanks", "that's helpful") or can be answered from previous chat messages or common knowledge (e.g. general facts), respond: **"no"**.
-    - If the message requires external knowledge, document retrieval, or detailed information not provided in the chat history, respond: **"yes"**.
-    - If the user's message is a simple factual question (e.g., "What is the capital of France?" or "How many days are in a week?"), respond: **"no"**.
-    
-    Chat History:
-    {context_str}
-
-    User Input:
-    {user_input}
-
-    Does this query need document retrieval? (Answer only "yes" or "no")
-    """
-
-    try:
-        response = client_classify.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt.strip()}],
-            temperature=0.0,
-            max_tokens=5
-        )
-        return response.choices[0].message.content.strip().lower() == "yes"
-    except:
-        return True
-
-
-def conversation_without_retrieval(user_input, chat_history):
-    messages = []
-    for msg in chat_history[-6:]:
-        messages.append({"role": msg["role"], "content": msg["content"]})
-    messages.append({"role": "user", "content": user_input})
-
-    try:
-        response = client_refine.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.1
-        )
-        return response.choices[0].message.content.strip()
-    except:
-        return "I'm sorry, I couldn't process that."    
-
-
-def generate_hypothetical_document(query: str) -> str:
-    prompt_template = f"""
-    You are a legal research assistant. Given a legal query, your task is to hypothesize what a relevant legal document might say in response, based on legal knowledge and common ordinance/resolution structures.
-
-    The hypothetical document should:
-    - Be plausible and consistent with actual local ordinances or legislative resolutions.
-    - Mention specific topics or legal actions relevant to the query.
-    - Be structured formally, like a section or excerpt from a resolution or ordinance.
-    - Avoid repetition of the query itself—focus on what the document would actually contain.
-    - If the response is in a language other than English, translate it into English before presenting the final output.
-
-    Query:
-    "{query}"
-
-    Generate a hypothetical legal document (in 1–2 paragraphs) that could plausibly be retrieved in response to this query.
-    """
-
-    try:
-        response = client_hyde.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a legal assistant."},
-                {"role": "user", "content": prompt_template}
-            ],
-            temperature=0.7,
-            max_tokens=512
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return "Error generating hypothetical document" 
-
-
-def generate_response(query, context_docs, context_sources):
-    context_str = "\n\n".join([f"Document {index + 1}:\n{doc['text']}" for index, doc in enumerate(context_docs)])
-    prompt = f"""
-    You are a legal AI assistant helping users find information from ordinances and resolutions. 
-    Answer the query **strictly using the provided context below**. 
-    Do NOT make up information or guess. If the answer is not explicitly stated in the context, respond with: 
-    "Based on the available documents, there is no clear answer to the query."
-
-    If you use any context in your answer, you must clearly indicate which document(s) you used **using the format: "Document X"** (with uppercase 'D' and a space before the number). Do not use "document", "doc", "DOC", or any other variation.
-
-    Query: {query}
-
-    Context: {context_str if context_docs else 'No relevant documents found.'}
-    """
-    
-    try:
-        response = client_generation.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt.strip()}],
-            temperature=0.1
-        )
-        
-        generated_answer = response.choices[0].message.content.strip()
-
-        doc_numbers = re.findall(r"document\s+(\d+)", generated_answer, re.IGNORECASE)
-        print(f"Document numbers found: {doc_numbers}")
-        relevant_sources = [context_sources[int(num) - 1] for num in doc_numbers if num.isdigit()]
-        relevant_contexts = [context_docs[int(num) - 1] for num in doc_numbers if num.isdigit()]
-
-        generated_answer = re.sub(
-            r"(\(?\s*(See\s+)?(Sources?:\s*)?(Document\s+\d+[,\s]*)+(and\s+)?(Document\s+\d+)?\s*\)?)", 
-            "", 
-            generated_answer, 
-            flags=re.IGNORECASE
-        ).strip()
-        return generated_answer, relevant_sources, relevant_contexts
-    except Exception as e:
-        return "Error generating response", [], []
-    
-
-def refine_query_with_history(new_query, chat_history):
-    context_messages = []
-    for msg in reversed(chat_history):
-        if msg["role"] == "user":
-            context_messages.insert(0, f"User: {msg['content']}")
-        elif msg["role"] == "assistant":
-            context_messages.insert(0, f"Assistant: {msg['content']}")
-        if len(context_messages) >= 6: 
-            break
-    
-    context_str = "\n".join(context_messages[-6:]) if context_messages else "No previous context"
-    
-    prompt = f"""
-    You're a legal query refiner helping create effective search queries. Consider both:
-    1. The new user query
-    2. Relevant context from chat history (if applicable)
-
-    Your task:
-    - If the input is a valid legal-related query, refine it into a standalone, clear, **affirmative sentence** (not a question), in English, suitable for document search.
-
-    Chat History (most recent first): {context_str}
-
-    New Query: {new_query}
-
-    Refined Search Query (respond ONLY with the refined query in ENGLISH):
-    """
-
-    try:
-        response = client_refine.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt.strip()}],
-            temperature=0.3,
-            max_tokens=300
-        )
-        return response.choices[0].message.content.strip()
-    except:
-        return new_query

@@ -8,18 +8,29 @@ import os
 import torch
 import pandas as pd
 from transformers import AutoTokenizer, AutoModel
+from django.conf import settings
 import weaviate
 import re
 
+from .models import ModelManager
+
+# Initialize models 
+base_dir = os.path.dirname(os.path.abspath(__file__))
+embedding_path = os.path.join(base_dir, "..", "embeddings")
+# For embedding model
+model_manager = ModelManager(embedding_path)  
+# For classification, query transformation, generation, and validation
+client = OpenAI()
+
 class TextractProcessor:
-    def __init__(self, base_dir, bucket_name='capstone-bucket-alister'):
+    def __init__(self, base_dir, bucket_name=None):
         self.textract = boto3.client('textract')
         self.s3 = boto3.client('s3')
-        self.bucket_name = bucket_name
+        self.bucket_name = bucket_name or settings.AWS_BUCKET_NAME
         self.base_dir = base_dir 
 
     def process_pdf(self, file_path):
-        file_name_no_ext = os.path.splitext(os.path.basename(file_path))[0].replace(" ", "_").replace(",", "").replace(":", "")
+        file_name_no_ext = os.path.splitext(os.path.basename(file_path))[0]
         output_folder = os.path.join(self.base_dir, file_name_no_ext)
         os.makedirs(output_folder, exist_ok=True)
 
@@ -168,7 +179,7 @@ class DocumentPreprocessor:
             filtered.to_csv(final_path, index=False, encoding='utf-8')
             return final_path, filtered
 
-        table_df['TableNumber'] = table_df['Layout'].str.extract('(\d+)').astype(int)
+        table_df['TableNumber'] = table_df['Layout'].str.extract(r'(\d+)').astype(int)
         table_groups = self._group_consecutive_tables(table_df)
 
         for group in table_groups:
@@ -260,7 +271,7 @@ class DocumentPreprocessor:
 
 
 class DocumentIndexer:
-    def __init__(self, model_manager):
+    def __init__(self, model_manager=model_manager):
         self.model_manager = model_manager
         self.client = weaviate.connect_to_local()
 
@@ -289,25 +300,26 @@ class DocumentIndexer:
         text = filtered_df['Text'].to_list()
         hierarchical_chunks = self._process_hierarchical_chunk(text)
 
-        with self.client.batch.dynamic() as batch:
-            for hierarchical_chunk in hierarchical_chunks:
-                first_line = hierarchical_chunk.split('\n')[0].strip().lstrip("'")
-                section_name = next((cat for key, cat in self.section_categories.items() if first_line.startswith(key)), "Uncategorized")
-                chunks = self._split_text(hierarchical_chunk)
+        try:
+            with self.client.batch.dynamic() as batch:
+                for hierarchical_chunk in hierarchical_chunks:
+                    first_line = hierarchical_chunk.split('\n')[0].strip().lstrip("'")
+                    section_name = next((cat for key, cat in self.section_categories.items() if first_line.startswith(key)), "Uncategorized")
+                    chunks = self._split_text(hierarchical_chunk)
 
-                for index, chunk in enumerate(chunks):
-                    embedding = self.model_manager.get_embedding(chunk)
-
-                    data_object = {
-                        "source": os.path.basename(doc_dir),
-                        "category": section_name,
-                        "chunk_index": index + 1,
-                        "text": chunk
-                    }
-
-                    legal_docs = self.client.collections.get("BAAI")
-                    legal_docs.data.insert(properties=data_object, vector=embedding)
-                    print(f"Added {os.path.basename(doc_dir)} ({section_name}) chunk {index + 1}")
+                    for index, chunk in enumerate(chunks):
+                        embedding = self.model_manager.get_embedding(chunk)
+                        data_object = {
+                            "source": os.path.basename(doc_dir),
+                            "category": section_name,
+                            "chunk_index": index + 1,
+                            "text": chunk
+                        }
+                        legal_docs = self.client.collections.get("BAAI")
+                        legal_docs.data.insert(properties=data_object, vector=embedding)
+                        print(f"Added {os.path.basename(doc_dir)} ({section_name}) chunk {index + 1}")
+        finally:
+            self.client.close()
 
     def _process_hierarchical_chunk(self, text):
         sections, current_section, used_sections = [], [], set()
