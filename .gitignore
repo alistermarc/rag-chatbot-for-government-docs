@@ -29,5 +29,10 @@ env/
 Thumbs.db
 
 embeddings/
+New Documents/
+weaviate_data/
+weaviate/
+.streamlit.py.swp
+weavaiate-db.tar.gz
 
 
