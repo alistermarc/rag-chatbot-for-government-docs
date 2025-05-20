@@ -68,10 +68,16 @@ if user_input := st.chat_input("Ask about local ordinances and resolutions:"):
     with st.chat_message("user"):
         st.markdown(user_input)
 
+    # Clean chat history before sending to backend
+    history = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in st.session_state.messages
+    ]
+
     # Backend API call
     response = requests.post(
         'http://127.0.0.1:8000/api/chat/',
-        json={"message": user_input, "history": st.session_state.messages}
+        json={"message": user_input, "history": history}
     )
 
     if response.status_code == 200:
