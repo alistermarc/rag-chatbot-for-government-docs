@@ -299,7 +299,7 @@ class DocumentIndexer:
         filtered_df = df[~df['Layout'].str.startswith("Table")]
         text = filtered_df['Text'].to_list()
         hierarchical_chunks = self._process_hierarchical_chunk(text)
-
+        print(f"Hierarchical chunks: {len(hierarchical_chunks)}")
         try:
             with self.client.batch.dynamic() as batch:
                 for hierarchical_chunk in hierarchical_chunks:

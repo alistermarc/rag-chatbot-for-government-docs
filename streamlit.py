@@ -1,50 +1,48 @@
 import streamlit as st
 import requests
 
-# Initialize session state
-if "chats" not in st.session_state:
-    st.session_state.chats = {
-        "default": {
-            "messages": [],
-            "sources": set()
-        }
-    }
-if "current_chat" not in st.session_state:
-    st.session_state.current_chat = "default"
+# Initialize single chat session
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-# Sidebar for chat management
+# Sidebar: PDF Upload and Clear Chat
 with st.sidebar:
-    st.header("Chat History")
-    # New Chat button
-    if st.button("➕ New Chat"):
-        chat_id = f"chat_{len(st.session_state.chats) + 1}"
-        st.session_state.chats[chat_id] = {
-            "messages": [],
-            "sources": set()
-        }
-        st.session_state.current_chat = chat_id
+    st.header("Chat Options")
 
-    # Display chat history
-    for chat_id in st.session_state.chats:
-        if st.button(chat_id.capitalize().replace("_", " ")):
-            st.session_state.current_chat = chat_id
+    # Clear Chat button
+    if st.button("🗑️ Clear Chat"):
+        st.session_state.messages = []
 
     st.divider()
-    st.subheader("Upload PDF")
+    st.subheader("Upload PDFs (Batch Upload)")
 
-    uploaded_file = st.file_uploader("Choose a PDF", type=["pdf"])
-    if uploaded_file is not None:
-        if st.button("Upload and Process"):
-            # files = {"file": uploaded_file.getvalue()}
+    uploaded_files = st.file_uploader(
+        "Choose one or more PDF files",
+        type=["pdf"],
+        accept_multiple_files=True
+    )
+
+    if uploaded_files and st.button("Upload and Process All"):
+        files = [("file", (f.name, f, "application/pdf")) for f in uploaded_files]
+
+        try:
             upload_response = requests.post(
                 "http://127.0.0.1:8000/api/upload/",
-                files={"file": (uploaded_file.name, uploaded_file, "application/pdf")}
+                files=files
             )
-            if upload_response.status_code == 201:
+
+            if upload_response.status_code == 207:
                 result = upload_response.json()
-                st.success(result["message"])
-                # Add to current chat's sources
-                st.session_state.chats[st.session_state.current_chat]["sources"].add(result["source"])
+                results = result.get("results", [])
+                for res in results:
+                    file = res.get("file", "Unknown file")
+                    status = res.get("status", "unknown")
+                    message = res.get("message", "")
+                    
+                    if status == "success":
+                        st.success(f"{file}: {message}")
+                    else:
+                        st.error(f"{file}: {message}")
             else:
                 try:
                     error_msg = upload_response.json().get("error", "Upload failed.")
@@ -52,29 +50,28 @@ with st.sidebar:
                     error_msg = "Upload failed."
                 st.error(error_msg)
 
-# Main chat interface
-current_chat = st.session_state.chats[st.session_state.current_chat]
+        except Exception as e:
+            st.error(f"Error during upload: {str(e)}")
 
-# Display messages for current chat
-for message in current_chat["messages"]:
+
+# Display chat messages
+for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message["role"] == "assistant" and message.get("sources"):
-            formatted_sources = [f"{src}" for src in message['sources']]
-            st.markdown(f"**Sources:** {', '.join(formatted_sources)}")
+            st.markdown(f"**Sources:** {', '.join(message['sources'])}")
 
-# Handle new input
+# Handle user input
 if user_input := st.chat_input("Ask about local ordinances and resolutions:"):
-    # Add user message to current chat
-    current_chat["messages"].append({"role": "user", "content": user_input})
-    
+    # Add user message
+    st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Call Django backend API
+    # Backend API call
     response = requests.post(
         'http://127.0.0.1:8000/api/chat/',
-        json={"message": user_input, "history": current_chat["messages"]}
+        json={"message": user_input, "history": st.session_state.messages}
     )
 
     if response.status_code == 200:
@@ -82,22 +79,20 @@ if user_input := st.chat_input("Ask about local ordinances and resolutions:"):
         final_response = data.get("answer", "No response from backend.")
         sources = data.get("sources", [])
 
-        # Add assistant response to current chat
-        current_chat["messages"].append({
+        st.session_state.messages.append({
             "role": "assistant",
             "query": user_input,
             "content": final_response,
             "sources": sources
         })
 
-        # Display assistant response
         with st.chat_message("assistant"):
             st.write(final_response)
             if sources:
-                st.markdown(f"\n**Verified Sources:** {', '.join(sources)}")
+                st.markdown(f"**Sources:** {', '.join(sources)}")
     else:
         error_msg = "Error: Could not retrieve an answer."
-        current_chat["messages"].append({
+        st.session_state.messages.append({
             "role": "assistant",
             "content": error_msg,
             "sources": []

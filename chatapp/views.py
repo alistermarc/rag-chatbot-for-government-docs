@@ -7,22 +7,6 @@ import os
 import weaviate
 from .textract import TextractProcessor, DocumentPreprocessor, DocumentIndexer
 from .chat_agent import RetrievalDecisionModule, QueryTransformationModule, DocumentRetrievalModule, ResponseGeneratorModule, AnswerValidationAgent
-# from .chat_agent import AnswerValidationAgent, DocumentSearcher, refine_query_with_history, generate_hypothetical_document, generate_response, classify_if_retrieval_needed, conversation_without_retrieval
-# from .services import client_generation, client_refine, get_weaviate_client, load_models
-# from transformers import AutoTokenizer, AutoModel
-# import torch
-
-# class ModelManager:
-#     def __init__(self, model_path):
-#         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-#         self.model = AutoModel.from_pretrained(model_path, add_pooling_layer=True)
-
-#     def get_embedding(self, text):
-#         inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-#         with torch.no_grad():
-#             embeddings = self.model(**inputs)[0][:, 0]
-#         return torch.nn.functional.normalize(embeddings, p=2, dim=1).squeeze(0).tolist()
-# model_manager = ModelManager(r"C:\Users\Alister\Desktop\AI Classes\Capstone\Models2\Embeddings\BAAI\bge-base-en-v1.5")   
 
 
 class ChatAPIView(APIView):
@@ -88,29 +72,14 @@ class FileUploadAPIView(APIView):
     parser_classes = [MultiPartParser, FormParser]
 
     def post(self, request):
-        uploaded_file = request.FILES.get("file")
+        uploaded_files = request.FILES.getlist("file")
 
-        if not uploaded_file:
-            return Response({"error": "No file uploaded."}, status=status.HTTP_400_BAD_REQUEST)
+        if not uploaded_files:
+            return Response({"error": "No files uploaded."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not uploaded_file.name.lower().endswith(".pdf"):
-            return Response({"error": "Only PDF files are supported."}, status=status.HTTP_400_BAD_REQUEST)
-
-        file_name = uploaded_file.name
-        base_file_name = file_name[:-4]
-        if '-S-' in base_file_name:
-            parts = base_file_name.split('-S-')
-            base_file_name = f"{parts[0]}, S-{parts[1]}"
-        save_dir = "New Documents"
-        os.makedirs(save_dir, exist_ok=True)
-        file_path = os.path.join(save_dir, file_name)
-
-        # Save the file
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.read())
-
-        # Check if already indexed
+        results = []
         client = weaviate.connect_to_local()
+
         try:
             collection = client.collections.get("BAAI")
             existing_sources = [
@@ -118,35 +87,69 @@ class FileUploadAPIView(APIView):
                 for obj in collection.iterator(return_properties=["source"])
             ]
 
-            if base_file_name in existing_sources:
-                return Response(
-                    {"message": f"'{file_name}' already exists in the database."},
-                    status=status.HTTP_200_OK
-                )
+            for uploaded_file in uploaded_files:
+                file_name = uploaded_file.name
+
+                if '-S-' in file_name:
+                    parts = file_name.split('-S-')
+                    file_name = f"{parts[0]}, S-{parts[1]}"
+
+                if not file_name.lower().endswith(".pdf"):
+                    results.append({
+                        "file": file_name,
+                        "status": "failed",
+                        "message": "Only PDF files are supported."
+                    })
+                    continue
+
+                base_file_name = file_name[:-4]
+
+                if base_file_name in existing_sources:
+                    results.append({
+                        "file": file_name,
+                        "status": "failed",
+                        "message": "File already exists in the database."
+                    })
+                    continue
+
+                save_dir = "New Documents"
+                os.makedirs(save_dir, exist_ok=True)
+                file_path = os.path.join(save_dir, file_name)
+
+                with open(file_path, "wb") as f:
+                    f.write(uploaded_file.read())
+
+                output_folder = os.path.join(save_dir, base_file_name)
+                layout_csv_path = os.path.join(output_folder, "layout.csv")
+
+                processor = TextractProcessor(base_dir=save_dir)
+                processor.process_pdf(file_path)
+
+                if not os.path.exists(layout_csv_path):
+                    results.append({
+                        "file": file_name,
+                        "status": "failed",
+                        "message": "Textract processing failed."
+                    })
+                    continue
+
+                documentpreprocessor = DocumentPreprocessor()
+                documentpreprocessor.summarize(output_folder)
+
+                processtodatabase = DocumentIndexer()
+                processtodatabase.process_file_to_db(output_folder)
+
+                results.append({
+                    "file": file_name,
+                    "status": "success",
+                    "message": "Uploaded and processed successfully.",
+                    "source": base_file_name
+                })
+            print(f"Results: {results}")
         finally:
             client.close()
 
-        # Run Textract
-        output_folder = os.path.join(save_dir, base_file_name)
-        layout_csv_path = os.path.join(output_folder, "layout.csv")
-
-        processor = TextractProcessor(base_dir=save_dir)
-        processor.process_pdf(file_path)
-
-        if not os.path.exists(layout_csv_path):
-            return Response({"error": "Textract processing failed."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        # Preprocess and index
-        documentpreprocessor = DocumentPreprocessor()
-        documentpreprocessor.summarize(output_folder)
-
-        processtodatabase = DocumentIndexer()
-        processtodatabase.process_file_to_db(output_folder)
-
-        return Response({
-            "message": f"File '{file_name}' uploaded and processed successfully.",
-            "source": base_file_name
-        }, status=status.HTTP_201_CREATED)
+        return Response({"results": results}, status=status.HTTP_207_MULTI_STATUS)
 
 
 class CheckAPIView(APIView):
