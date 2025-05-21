@@ -1,17 +1,36 @@
 ---
 services:
+
+  chat-streamlit:
+    build: ./frontend
+    container_name: chat-streamlit
+    ports:
+      - "8501:8501"
+    restart: on-failure
+
+  chat-django:
+    build: .
+    container_name: chat-django
+    ports:
+      - "8000:8000"
+    restart: on-failure
+    env_file:
+      - .env
+    depends_on:
+      - weaviate
+
   weaviate:
     command:
-    - --host
-    - 0.0.0.0
-    - --port
-    - '8080'
-    - --scheme
-    - http
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8080'
+      - --scheme
+      - http
     image: cr.weaviate.io/semitechnologies/weaviate:1.30.1
     ports:
-    - 8080:8080
-    - 50051:50051
+      - 8080:8080
+      - 50051:50051
     volumes:
       - ./weaviate:/var/lib/weaviate
     restart: on-failure:0
@@ -24,4 +43,3 @@ services:
 volumes:
   weaviate_data:
 ...
- 
