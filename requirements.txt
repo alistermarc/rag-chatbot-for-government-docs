@@ -1,7 +1,14 @@
 boto3==1.38.5
 Django==5.2.1
+django-cors-headers==4.7.0
+djangorestframework==3.16.0
+gunicorn==23.0.0
 openai==1.78.1
 pandas==2.2.3
 Requests==2.32.3
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch==2.1.1+cpu
 transformers==4.48.1
-weaviate_client==4.11.3
+weaviate-client==4.11.3
+python-dotenv==1.1.0
+streamlit==1.45.1
