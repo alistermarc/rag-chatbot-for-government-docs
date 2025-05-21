@@ -1,7 +1,7 @@
 services:
 
   chat-streamlit:
-    build: ./frontend
+    image: chat-streamlit:latest
     container_name: chat-streamlit
     ports:
       - "8501:8501"
@@ -30,7 +30,7 @@ services:
       CLUSTER_HOSTNAME: 'node1'
 
   chat-django:
-    build: .
+    image: chat-django:latest
     container_name: chat-django
     ports:
       - "8000:8000"
