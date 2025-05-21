@@ -4,7 +4,7 @@ WORKDIR /app
 
 COPY . .
 
-RUN apt-get update && apt-get install -y
+RUN apt-get update && apt-get install -y gcc
 RUN pip install --upgrade pip==25.1.1
 RUN pip install --no-cache -r requirements.txt
 RUN pip install https://download.pytorch.org/whl/cpu/torch-2.1.1%2Bcpu-cp311-cp311-linux_x86_64.whl
