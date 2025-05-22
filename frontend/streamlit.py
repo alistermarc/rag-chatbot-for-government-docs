@@ -1,6 +1,8 @@
 import streamlit as st
 import requests
 
+backend_url = "chat-django"
+
 # Initialize single chat session
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -27,7 +29,7 @@ with st.sidebar:
 
         try:
             upload_response = requests.post(
-                "http://127.0.0.1:8000/api/upload/",
+                f"http://{backend_url}:8000/api/upload/",
                 files=files
             )
 
@@ -76,7 +78,7 @@ if user_input := st.chat_input("Ask about local ordinances and resolutions:"):
 
     # Backend API call
     response = requests.post(
-        'http://127.0.0.1:8000/api/chat/',
+        f'http://{backend_url}:8000/api/chat/',
         json={"message": user_input, "history": history}
     )
 
