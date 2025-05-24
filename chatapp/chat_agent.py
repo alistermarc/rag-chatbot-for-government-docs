@@ -130,7 +130,7 @@ class QueryTransformationModule:
 
 
 class DocumentRetrievalModule(AbstractContextManager):
-    def __init__(self, host="localhost", collection_name="BAAI", alpha=0.5, context_window=1):
+    def __init__(self, host="weaviate", collection_name="BAAI", alpha=0.5, context_window=1):
         self.host = host
         self.collection_name = collection_name
         self.alpha = alpha

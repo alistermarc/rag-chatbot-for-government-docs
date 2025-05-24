@@ -36,7 +36,7 @@ class ChatAPIView(APIView):
         else:
             refined_query = query_transformation_module.refine_query_with_history(user_input, context_str)
 
-            with DocumentRetrievalModule(host="localhost", collection_name="BAAI", alpha=0.5) as searcher:
+            with DocumentRetrievalModule(host="weaviate", collection_name="BAAI", alpha=0.5) as searcher:
                 agent = AnswerValidationAgent()
                 while agent.current_attempt < agent.max_attempts:
                     if agent.current_attempt > 0:
