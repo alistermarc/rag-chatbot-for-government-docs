@@ -34,5 +34,4 @@ weaviate_data/
 weaviate/
 .streamlit.py.swp
 weavaiate-db.tar.gz
-
-
+capstone_venv/
