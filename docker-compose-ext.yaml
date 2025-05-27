@@ -1,5 +1,12 @@
----
 services:
+
+  chat-streamlit:
+    image: chat-streamlit:latest
+    container_name: chat-streamlit
+    ports:
+      - "8501:8501"
+    restart: on-failure
+
   weaviate:
     command:
       - --host
@@ -21,6 +28,14 @@ services:
       PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
       ENABLE_API_BASED_MODULES: 'true'
       CLUSTER_HOSTNAME: 'node1'
-volumes:
-  weaviate_data:
-...
+
+  chat-django:
+    image: chat-django:latest
+    container_name: chat-django
+    ports:
+      - "8000:8000"
+    restart: on-failure
+    env_file:
+      - .env
+    depends_on:
+      - weaviate
