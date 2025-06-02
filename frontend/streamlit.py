@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 
-backend_url = "chat-django"
+backend_url = "localhost"
 
 # Initialize single chat session
 if "messages" not in st.session_state:

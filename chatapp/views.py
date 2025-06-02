@@ -36,10 +36,10 @@ class ChatAPIView(APIView):
         else:
             refined_query = query_transformation_module.refine_query_with_history(user_input, context_str)
 
-            with DocumentRetrievalModule(host="weaviate", collection_name="BAAI", alpha=0.5) as searcher:
+            with DocumentRetrievalModule(host="localhost", collection_name="BAAI", alpha=0.5) as searcher:
                 agent = AnswerValidationAgent()
                 while agent.current_attempt < agent.max_attempts:
-                    if agent.current_attempt > 0:
+                    if agent.current_attempt > 1:
                         refined_query = query_transformation_module.generate_hypothetical_document(refined_query)
 
                     print(f"Attempt {agent.current_attempt + 1} with query: {refined_query}")
@@ -52,7 +52,7 @@ class ChatAPIView(APIView):
                     print(f"Relevant sources: {relevant_sources}")
 
                     if agent.validate_answer(response, relevant_contexts, user_input) and relevant_sources:
-                        final_response = response
+                        final_response = agent.refine_answer(user_input,response)
                         all_sources.update(relevant_sources)
                         break
 

@@ -31,7 +31,7 @@ class RetrievalDecisionModule:
         You are an assistant helping decide whether a user message needs document retrieval or not.
 
         Instructions:
-        - If the user's message is purely conversational (e.g. "hi", "thanks", "that's helpful") or can be answered from previous chat messages or common knowledge (e.g. general facts), respond: **"no"**.
+        - If the user's message is purely conversational (e.g. "hi", "thanks", "ok", "that's helpful") or can be answered from previous chat messages or common knowledge (e.g. general facts), respond: **"no"**.
         - If the message requires external knowledge, document retrieval, or detailed information not provided in the chat history, respond: **"yes"**.
         - If the user's message is a simple factual question (e.g., "What is the capital of France?" or "How many days are in a week?"), respond: **"no"**.
         
@@ -61,7 +61,7 @@ class QueryTransformationModule:
         self,
         client=client,
         refine_model="gpt-4o-mini",
-        hyde_model="gpt-4o-mini",
+        hyde_model="gpt-4o-mini-search-preview",
         refine_temperature=0.3,
         hyde_temperature=0.7,
         refine_max_tokens=300,
@@ -104,7 +104,7 @@ class QueryTransformationModule:
 
     def generate_hypothetical_document(self, query: str) -> str:
         prompt = f"""
-        You are a legal research assistant. Based on the query below, generate a short, hypothetical excerpt from a legal document (e.g., ordinance or resolution) that could plausibly address it.
+        You are a legal research assistant. Based on the query below, generate an answer that could plausibly address it.
 
         - The content should be realistic and relevant.
         - Structure it formally, like a legal provision.
@@ -121,7 +121,6 @@ class QueryTransformationModule:
                 messages=[
                     {"role": "user", "content": prompt.strip()}
                 ],
-                temperature=self.hyde_temperature,
                 max_tokens=self.hyde_max_tokens
             )
             return response.choices[0].message.content.strip()
@@ -130,7 +129,7 @@ class QueryTransformationModule:
 
 
 class DocumentRetrievalModule(AbstractContextManager):
-    def __init__(self, host="weaviate", collection_name="BAAI", alpha=0.5, context_window=1):
+    def __init__(self, host="localhost", collection_name="BAAI", alpha=0.5, context_window=1):
         self.host = host
         self.collection_name = collection_name
         self.alpha = alpha
@@ -267,8 +266,8 @@ class ResponseGeneratorModule:
     def __init__(
         self,
         client=client,
-        generation_model_with_retrieval="gpt-4o",
-        generation_model_without_retrieval="gpt-4o-mini",
+        generation_model_with_retrieval="gpt-4o-mini",
+        generation_model_without_retrieval="gpt-4o-mini-search-preview",
         generation_temperature=0.1,
         max_tokens=512
     ):
@@ -280,7 +279,7 @@ class ResponseGeneratorModule:
 
     def conversation_without_retrieval(self, user_input, context_str=None):
         prompt = f"""
-        You are a Quezon City Legal Provider. Answer the query using your internal knowledge or the provided conversation history if applicable.
+        You are Alex, a Quezon City Legal Provider. Answer the query using your internal knowledge or the provided conversation history if applicable. 
 
         Conversation history:
         {context_str if context_str else 'No previous conversation history.'}
@@ -296,7 +295,6 @@ class ResponseGeneratorModule:
             response = self.client.chat.completions.create(
                 model=self.generation_model_without_retrieval,
                 messages=[{"role": "user", "content": prompt.strip()}],
-                temperature=self.generation_temperature,
                 max_tokens=self.max_tokens
             )
             return response.choices[0].message.content.strip()
@@ -305,17 +303,17 @@ class ResponseGeneratorModule:
 
 
     def generate_response(self, query, context_docs, context_sources):
-        context_str = "\n\n".join(
-            [f"Document {index + 1}:\n{doc['text']}" for index, doc in enumerate(context_docs)]
-        )
+            
+        context_str = "\n\n".join([
+            f"Document {index + 1} (Source: {context_sources[index]}):\n{doc['text']}"
+            for index, doc in enumerate(context_docs)
+        ])
         
         prompt = f"""
         You are a legal AI assistant helping users find information from ordinances and resolutions. 
-        Answer the query **strictly using the provided context below**. 
-        Do NOT make up information or guess. If the answer is not explicitly stated in the context, respond with: 
-        "Based on the available documents, there is no clear answer to the query."
+        Answer the query **strictly using the provided context below**. Give an empty answer, if answer is not in the context.
+        If you use any context in your answer, you must clearly indicate which document(s) you used only at the end of your response using the format: "Document X" (e.g. Document 1, Document 2). Do not include any document numbers if response was not based in any of the documents.
 
-        If you use any context in your answer, you must clearly indicate which document(s) you used **using the format: "Document X"** (e.g. Document 1, Document 2).
 
         Query: {query}
 
@@ -377,7 +375,7 @@ class AnswerValidationAgent:
 
         Evaluate the answer based on the provided documents according to these criteria:
         - Correctness: Does the answer accurately reflect information from the documents?
-        - Completeness: Does the answer include all critical and relevant information?
+        - Completeness: Does the answer include all critical and relevant information to the query?
         - Honesty: Does the answer avoid making claims not supported by the documents?
 
         If the answer fails any of these criteria, or if critical information is missing, or if unsupported claims are made, consider it invalid.
@@ -402,3 +400,26 @@ class AnswerValidationAgent:
             return 'valid' in content and 'invalid' not in content
         except Exception:
             return False
+
+    def refine_answer(self, question, answer):
+        prompt = f"""
+        Improve the phrasing of the answer based on the question.
+        Do not add or remove information. Just make it clear and well-written.
+
+        Question: {question}
+        Answer: {answer}
+
+        Refined Answer:
+        """
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt.strip()}],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens
+            )
+            refined = response.choices[0].message.content.strip()
+            return refined
+        except Exception:
+            return answer
