@@ -163,10 +163,11 @@ Capstone-Project/
 │   ├── views.py
 │   ├── textract.py               # For document indexing
 │   ├── chat_agent.py             # RAG modules
-├── New Documents/                # Uploaded and processed PDFs
-├── embedding/                    # Local embedding model directory
-├── db.sqlite3
-└── ...
+├── evaluations/                  # Test datasets and evaluations performed
+├── embeddings/                   # Local embedding model directory (downloaded when download_embedding.py is run)
+├── requirements.txt              # Packages needed to run the project
+├── docker-compose.yaml           
+└── manage.py
 ```
 
 ---
